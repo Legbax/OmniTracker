@@ -1,0 +1,6 @@
+id=zygisk_telemetry_sniffer
+name=Zygisk Telemetry Sniffer
+version=v1.0.0
+versionCode=1
+author=Developer
+description=A Zygisk module to intercept and sniff telemetry APIs at Java, Native (C/C++), and Binder levels to help map Android app tracking behaviors without leaving a trace.
