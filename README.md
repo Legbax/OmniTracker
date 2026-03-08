@@ -1,6 +1,6 @@
 # Zygisk Telemetry Sniffer
 
-This module is an independent "Sniffer de Telemetría" that operates within the Zygisk environment (Magisk / KernelSU) to monitor Android application tracking behaviors without leaving an observable trace in userland environments.
+This module is an independent "Sniffer" that operates within the Zygisk environment (Magisk / KernelSU) to monitor Android application tracking behaviors without leaving an observable trace in userland environments.
 
 ## Architecture
 
