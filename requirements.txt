@@ -1,0 +1,20 @@
+# Android 3-Layer Identifier Monitor — Python dependencies
+#
+# IMPORTANTE: la versión de frida debe coincidir exactamente con la versión
+# del binario frida-server instalado en el dispositivo Android.
+#
+# Para saber qué versión tienes instalada:
+#   python -m pip show frida
+#
+# Para descargar el binario frida-server correspondiente:
+#   https://github.com/frida/frida/releases
+#   Busca: frida-server-<versión>-android-arm64  (o arm si el dispositivo es de 32-bit)
+#
+# Instalación en el dispositivo:
+#   adb push frida-server /data/local/tmp/
+#   adb shell "su -c 'chmod 755 /data/local/tmp/frida-server'"
+#   adb shell "su -c '/data/local/tmp/frida-server &'"
+
+frida>=16.0.0
+frida-tools>=12.0.0
+colorama>=0.4.6

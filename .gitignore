@@ -1,0 +1,40 @@
+# --- Databases extracted from device (user data) ---
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+
+# --- Capture output and logs ---
+captures/
+*.jsonl
+*.log
+full_dump.txt
+Report.txt
+
+# --- Heavy binaries (downloadable from upstream) ---
+bin/frida-server*
+bin/frida-stealth
+sqlite3_arm64
+
+# --- One-off reports (kept locally, out of git) ---
+INFORME_DUMP1_vs_DUMP2.md
+UPGRADE_A13_REPORT.md
+Cross_Dump_Comparison_Report.docx
+
+# --- Frida runtime state ---
+PersistentStores
+PersistentStores_global
+valdi_memories
+valdi_turn_db
+
+# --- Tooling ---
+.claude/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# --- OS ---
+.DS_Store
+Thumbs.db
