@@ -37,6 +37,15 @@ Java.perform(function () {
     return true;
   }
 
+  // Re-entrancy guard: when OmniTracker itself iterates a SubscriptionInfo
+  // list inside `getActiveSubscriptionInfoList` to log details, the per-getter
+  // hooks below must NOT emit — otherwise we'd report ourselves as the caller.
+  var _introspectingSubInfo = false;
+
+  // Cached SDK_INT for SUBINFO_* extras. Best-effort; 0 if Build$VERSION fails.
+  var _sdkIntCached = 0;
+  try { _sdkIntCached = Java.use("android.os.Build$VERSION").SDK_INT.value; } catch (e) {}
+
   // ─── Temporal correlation — digest burst → Cipher.doFinal ──────────────────
 
   var digestWindow = [];
@@ -1528,20 +1537,25 @@ Java.perform(function () {
       if (isNew("SUB_INFO_LIST", count)) {
         var details = [];
         if (list !== null) {
-          for (var i = 0; i < Math.min(count, 5); i++) {
-            try {
-              var info = list.get(i);
-              details.push({
-                subId: info.getSubscriptionId(),
-                iccId: info.getIccId(),
-                simSlot: info.getSimSlotIndex(),
-                displayName: info.getDisplayName() ? info.getDisplayName().toString() : null,
-                carrierName: info.getCarrierName() ? info.getCarrierName().toString() : null,
-                countryIso: info.getCountryIso(),
-                mcc: info.getMcc(),
-                mnc: info.getMnc()
-              });
-            } catch (e) {}
+          _introspectingSubInfo = true;
+          try {
+            for (var i = 0; i < Math.min(count, 5); i++) {
+              try {
+                var info = list.get(i);
+                details.push({
+                  subId: info.getSubscriptionId(),
+                  iccId: info.getIccId(),
+                  simSlot: info.getSimSlotIndex(),
+                  displayName: info.getDisplayName() ? info.getDisplayName().toString() : null,
+                  carrierName: info.getCarrierName() ? info.getCarrierName().toString() : null,
+                  countryIso: info.getCountryIso(),
+                  mcc: info.getMcc(),
+                  mnc: info.getMnc()
+                });
+              } catch (e) {}
+            }
+          } finally {
+            _introspectingSubInfo = false;
           }
         }
         var subExtra = { count: count, details: details };
@@ -1572,6 +1586,96 @@ Java.perform(function () {
       return info;
     }
   );
+
+  // ─── Direct SubscriptionInfo getters ──────────────────────────────────────
+  // OmniShield hooks the classic TelephonyManager getters (getSimSerialNumber,
+  // getLine1Number, getSimOperator, ...) but does NOT cover per-instance
+  // SubscriptionInfo getters. If Snapchat reads identifiers directly off a
+  // SubscriptionInfo it received from getActiveSubscriptionInfoList, those
+  // values come straight from the physical SIM — divergent from the spoofed
+  // TelephonyManager values. These hooks emit one event per call so we can
+  // tell empirically which getters Snap exercises and confirm the leak.
+  //
+  // Self-recursion guard: the getActiveSubscriptionInfoList hook above
+  // iterates its own result to populate `details[]`, calling several of these
+  // getters. Each hook below short-circuits when `_introspectingSubInfo` is
+  // true so we don't report ourselves.
+
+  function subInfoEmit(eventType, rawValue, ctx) {
+    var strVal = rawValue === null || rawValue === undefined ? "null" : String(rawValue);
+    var subId = -1, simSlot = -1;
+    try { subId = ctx.getSubscriptionId(); } catch (e) {}
+    try { simSlot = ctx.getSimSlotIndex(); } catch (e) {}
+    var dedupKey = String(subId) + ":" + strVal;
+    if (isNew(eventType, dedupKey)) {
+      emit(eventType, strVal, {
+        subId: subId,
+        simSlot: simSlot,
+        sdkInt: _sdkIntCached
+      });
+    }
+  }
+
+  function makeSubInfoStringHook(methodName, eventType) {
+    return function () {
+      var v = this[methodName]();
+      if (_introspectingSubInfo) return v;
+      try { subInfoEmit(eventType, v, this); } catch (e) {}
+      return v;
+    };
+  }
+
+  function makeSubInfoIntHook(methodName, eventType) {
+    return function () {
+      var v = this[methodName]();
+      if (_introspectingSubInfo) return v;
+      try { subInfoEmit(eventType, v, this); } catch (e) {}
+      return v;
+    };
+  }
+
+  function makeSubInfoCharSeqHook(methodName, eventType) {
+    return function () {
+      var v = this[methodName]();
+      if (_introspectingSubInfo) return v;
+      try { subInfoEmit(eventType, v ? v.toString() : null, this); } catch (e) {}
+      return v;
+    };
+  }
+
+  function makeSubInfoBoolHook(methodName, eventType) {
+    return function () {
+      var v = this[methodName]();
+      if (_introspectingSubInfo) return v;
+      try { subInfoEmit(eventType, v ? "true" : "false", this); } catch (e) {}
+      return v;
+    };
+  }
+
+  // String getters — leaked identifiers
+  hookMethod("android.telephony.SubscriptionInfo", "getIccId",        [], makeSubInfoStringHook("getIccId",        "SUBINFO_ICCID"));
+  hookMethod("android.telephony.SubscriptionInfo", "getNumber",       [], makeSubInfoStringHook("getNumber",       "SUBINFO_NUMBER"));
+  hookMethod("android.telephony.SubscriptionInfo", "getMccString",    [], makeSubInfoStringHook("getMccString",    "SUBINFO_MCC"));
+  hookMethod("android.telephony.SubscriptionInfo", "getMncString",    [], makeSubInfoStringHook("getMncString",    "SUBINFO_MNC"));
+  hookMethod("android.telephony.SubscriptionInfo", "getCountryIso",   [], makeSubInfoStringHook("getCountryIso",   "SUBINFO_COUNTRY_ISO"));
+  hookMethod("android.telephony.SubscriptionInfo", "getCardString",   [], makeSubInfoStringHook("getCardString",   "SUBINFO_CARD_STRING"));
+
+  // CharSequence getters — need toString()
+  hookMethod("android.telephony.SubscriptionInfo", "getCarrierName",  [], makeSubInfoCharSeqHook("getCarrierName", "SUBINFO_CARRIER_NAME"));
+  hookMethod("android.telephony.SubscriptionInfo", "getDisplayName",  [], makeSubInfoCharSeqHook("getDisplayName", "SUBINFO_DISPLAY_NAME"));
+
+  // ParcelUuid — toString() like CharSequence
+  hookMethod("android.telephony.SubscriptionInfo", "getGroupUuid",    [], makeSubInfoCharSeqHook("getGroupUuid",   "SUBINFO_GROUP_UUID"));
+
+  // int getters
+  hookMethod("android.telephony.SubscriptionInfo", "getMcc",             [], makeSubInfoIntHook("getMcc",             "SUBINFO_MCC_INT"));
+  hookMethod("android.telephony.SubscriptionInfo", "getMnc",             [], makeSubInfoIntHook("getMnc",             "SUBINFO_MNC_INT"));
+  hookMethod("android.telephony.SubscriptionInfo", "getCardId",          [], makeSubInfoIntHook("getCardId",          "SUBINFO_CARD_ID"));
+  hookMethod("android.telephony.SubscriptionInfo", "getSubscriptionId",  [], makeSubInfoIntHook("getSubscriptionId",  "SUBINFO_SUB_ID"));
+  hookMethod("android.telephony.SubscriptionInfo", "getSimSlotIndex",    [], makeSubInfoIntHook("getSimSlotIndex",    "SUBINFO_SIM_SLOT"));
+
+  // boolean — eSIM flag
+  hookMethod("android.telephony.SubscriptionInfo", "isEmbedded",      [], makeSubInfoBoolHook("isEmbedded",        "SUBINFO_IS_EMBEDDED"));
 
   // ═══════════════════════════════════════════════════════════════════════════
   // PACKAGE MANAGER — getPackageInfo (app signature / installer detection)
