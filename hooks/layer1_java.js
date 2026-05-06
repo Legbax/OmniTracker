@@ -1473,6 +1473,193 @@ Java.perform(function () {
   });
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // OKHTTP REQUEST + CRONET + HTTPURL + INTEGRITY — DISABLED by default
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Empirically these hooks correlate with SIGSEGV in art::FindOatMethodFor
+  // (~30s after attach in com.snapchat.android Thread-4). Hypothesis: hooking
+  // abstract / interface-like methods (HttpURLConnection.connect is abstract,
+  // Cronet UrlRequest.start is interface-defined, IntegrityManager methods
+  // are interface) creates ArtMethod stubs whose oat_method_offset_ field
+  // resolves to garbage, causing ART's OAT lookup to deref a low pointer.
+  // Set globalThis._OT_HTTP_INTEGRITY_HOOKS = true to force-enable for
+  // diagnostic runs against non-ART-sensitive targets.
+  // Re-enabled by default after the real root cause (Debug.isDebuggerConnected
+  // recursion in layer4_scanner.js) was fixed. The art::FindOatMethodFor
+  // crashes were almost certainly the scanner stack overflow corrupting ART,
+  // not these hooks. Opt-out with `globalThis._OT_HTTP_INTEGRITY_HOOKS = false`
+  // if a target turns out to be sensitive.
+  if (globalThis._OT_HTTP_INTEGRITY_HOOKS === false) {
+    emit("__INIT__", "OkHttp REQUEST + Cronet + HttpURLConnection + IntegrityManager hooks DISABLED (opt-out via _OT_HTTP_INTEGRITY_HOOKS=false)");
+  } else {
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // OKHTTP — REQUEST body capture (complement to existing response capture)
+  // Critical for seeing X-Snapchat-Argos-Token, identity payloads, attestation
+  // tokens that travel in POST bodies and headers BEFORE TLS encrypts them.
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  function peekRequestBody(reqBody) {
+    if (!reqBody) return null;
+    // CRITICAL: skip one-shot/duplex bodies. writeTo() consumes the body, so
+    // peeking a streamed multipart upload would silently send 0 bytes upstream
+    // and break the target app's actual networking. Only peek bodies that can
+    // be safely written twice (RequestBody.isDuplex==false && isOneShot==false).
+    try {
+      if (reqBody.isOneShot && reqBody.isOneShot()) return "<one-shot body — skipped to preserve upload>";
+      if (reqBody.isDuplex  && reqBody.isDuplex())  return "<duplex body — skipped>";
+    } catch (eGuard) { /* older OkHttp without these methods — fall through */ }
+    var Buffer, buf = null;
+    try {
+      Buffer = Java.use("okio.Buffer");
+      buf = Buffer.$new();
+      reqBody.writeTo(buf);
+      return buf.readUtf8();
+    } catch (e) {
+      return null;
+    } finally {
+      // okio.Buffer is Closeable — release segment-pool slots.
+      if (buf) { try { buf.close(); } catch (eClose) {} }
+    }
+  }
+
+  // Snap routes calls through OkHttp interceptor chain. Capturing the chain
+  // entry gives us request URL, method, headers, AND body, before any
+  // upstream interceptor adds the attestation header.
+  try {
+    var RealInterceptorChain = Java.use("okhttp3.internal.http.RealInterceptorChain");
+    RealInterceptorChain.proceed.overload("okhttp3.Request").implementation = function (request) {
+      try {
+        var url = request.url().toString();
+        var method = request.method();
+        var bodyStr = null;
+        try { bodyStr = peekRequestBody(request.body()); } catch (e) {}
+        var headersDump = null;
+        try {
+          var h = request.headers();
+          var size = h.size();
+          var lines = [];
+          for (var i = 0; i < size; i++) {
+            var name = h.name(i);
+            // Mask Authorization-like tokens but keep header name visible.
+            var val = h.value(i);
+            if (/auth|token|argos|attestation|cookie|session/i.test(name)) {
+              val = "<" + (val ? val.length : 0) + " chars>";
+            }
+            lines.push(name + ": " + val);
+          }
+          headersDump = lines.join("\n");
+        } catch (eH) {}
+        if (isNew("OKHTTP_REQUEST", url + ":" + (bodyStr ? bodyStr.length : 0))) {
+          emit("OKHTTP_REQUEST", bodyStr ? bodyStr.substring(0, 400) : null, {
+            url: url, method: method,
+            bodyLen: bodyStr ? bodyStr.length : 0,
+            headers: headersDump
+          });
+        }
+      } catch (eOuter) {}
+      return this.proceed(request);
+    };
+    emit("__INIT__", "OkHttp REQUEST body capture installed (RealInterceptorChain.proceed)");
+  } catch (e) {
+    // R8/proguard renames the okhttp3.internal.* package in many production
+    // builds. Surface this so the operator knows REQUEST capture is dead and
+    // OKHTTP_REQUEST events won't appear (RESPONSE/CALL still work).
+    emit("__INIT__", "OkHttp REQUEST capture INACTIVE (RealInterceptorChain not present — likely R8-stripped: " + e + ")");
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // CRONET / Conscrypt — Snap also uses Google's Cronet stack (gRPC) which
+  // skips OkHttp. Hook UrlRequest.start at the Cronet API level.
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  ["org.chromium.net.UrlRequest",
+   "org.chromium.net.impl.CronetUrlRequest"].forEach(function (cls) {
+    try {
+      var UrlReq = Java.use(cls);
+      if (UrlReq.start) {
+        UrlReq.start.implementation = function () {
+          try {
+            var u = null;
+            try { u = this.getUrl(); } catch (eU) {}
+            if (isNew("CRONET_REQUEST", String(u))) {
+              emit("CRONET_REQUEST", String(u), { class: cls });
+            }
+          } catch (e) {}
+          return this.start();
+        };
+      }
+    } catch (e) {}
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // HttpURLConnection — fallback for libs that bypass OkHttp/Cronet
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  ["java.net.HttpURLConnection", "javax.net.ssl.HttpsURLConnection"].forEach(function (cls) {
+    try {
+      var Conn = Java.use(cls);
+      if (Conn.connect) {
+        Conn.connect.implementation = function () {
+          try {
+            var u = null;
+            try { u = this.getURL().toString(); } catch (eU) {}
+            if (isNew("HTTPURL_CONNECT", String(u))) {
+              emit("HTTPURL_CONNECT", String(u), { class: cls });
+            }
+          } catch (e) {}
+          return this.connect();
+        };
+      }
+    } catch (e) {}
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PLAY INTEGRITY — IntegrityManager.requestIntegrityToken / standard request
+  // The token is computed inside com.google.android.gms (GMS) — we can't see
+  // its computation, but we CAN see the request invocation + nonce, and the
+  // returned token (which Snap forwards as X-PI-Token to its backend).
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  function _hookIntegrityClass(clsName, methodName) {
+    try {
+      var IM = Java.use(clsName);
+      if (!IM[methodName]) return false;
+      IM[methodName].overloads.forEach(function (ov) {
+        ov.implementation = function () {
+          try {
+            var args = Array.prototype.slice.call(arguments);
+            var argSummary = args.map(function (a) {
+              if (a === null || a === undefined) return "null";
+              try { return a.toString().substring(0, 120); } catch (e) { return typeof a; }
+            }).join(" | ");
+            emit("INTEGRITY_REQUEST", clsName + "." + methodName, {
+              args: argSummary,
+              note: "Play Integrity token request — actual computation occurs inside GMS process"
+            });
+          } catch (e) {}
+          // CRITICAL: must call the original via `this[methodName](...)` —
+          // calling `ov.apply(this, arguments)` re-invokes the wrapper and
+          // recurses infinitely (Snap hangs on Play Integrity invocation).
+          // Frida intercepts `this.<method>(args)` from inside .implementation
+          // and routes to the original unwrapped method.
+          return this[methodName].apply(this, arguments);
+        };
+      });
+      return true;
+    } catch (e) { return false; }
+  }
+
+  // Standard Play Integrity API entry points (Play Integrity API v1 + classic SafetyNet)
+  _hookIntegrityClass("com.google.android.play.core.integrity.IntegrityManager", "requestIntegrityToken");
+  _hookIntegrityClass("com.google.android.play.core.integrity.StandardIntegrityManager", "requestIntegrityToken");
+  _hookIntegrityClass("com.google.android.play.core.integrity.IntegrityTokenRequest", "build");
+  _hookIntegrityClass("com.google.android.gms.safetynet.SafetyNetClient", "attest");
+  // The provider-level call most apps use:
+  _hookIntegrityClass("com.google.android.play.core.integrity.IntegrityManagerFactory", "create");
+
+  }  // end of opt-in HTTP/Integrity hooks block
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // SETTINGS.SYSTEM — additional identity keys
   // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1602,10 +1789,13 @@ Java.perform(function () {
   // true so we don't report ourselves.
 
   function subInfoEmit(eventType, rawValue, ctx) {
+    if (_introspectingSubInfo) return;
     var strVal = rawValue === null || rawValue === undefined ? "null" : String(rawValue);
     var subId = -1, simSlot = -1;
+    _introspectingSubInfo = true;
     try { subId = ctx.getSubscriptionId(); } catch (e) {}
     try { simSlot = ctx.getSimSlotIndex(); } catch (e) {}
+    _introspectingSubInfo = false;
     var dedupKey = String(subId) + ":" + strVal;
     if (isNew(eventType, dedupKey)) {
       emit(eventType, strVal, {
@@ -2856,6 +3046,62 @@ Java.perform(function () {
   }
   setTimeout(scanSnapAttestationClasses, 3500);
   setTimeout(scanSnapAttestationClasses, 12000);
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ARGOS / x-snapchat-att hooks — REVERTED (2026-04-27)
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Tested adding three Java hooks here:
+  //   - iew.mpi.e([B)[B    (encrypt path; KQ8 plaintext → AESGCC20 cipher)
+  //   - iew.mpi.f([B,String)[B   (sign path; getSignature flow)
+  //   - java.lang.System.loadLibrary(String)   (lazy native-load tracker)
+  //
+  // RESULT — all three trip Snap's anti-tampering BEFORE attestation fires:
+  //   - With all 3 hooks: Snap stuck at password screen, libscplugin never
+  //     loads, no SNAP_ATT_* events.
+  //   - With just iew.mpi.e/f (System.loadLibrary removed): Snap throws
+  //     SS03 error, mpi.e never called.
+  //   - With only iew.mpi.e/f (3rd test, faster crash): Snap aborts even
+  //     earlier with fewer interactions.
+  //
+  // ROOT CAUSE: Snap performs pre-flight Java method validation on
+  // attestation-critical classes before any actual attestation request
+  // fires. iew.mpi (the JNI bridge to libscplugin's AESGCC20 crypto) is
+  // explicitly in that scan. Frida's `.implementation = ...` modifies the
+  // ArtMethod's `entry_point_from_jni_` (offset 24 on aarch64) to point to
+  // a Frida-allocated trampoline in an anonymous mmap region — Snap reads
+  // the entry point, sees it's not in the expected interpreter / jit-code
+  // / oat-compiled region, flags as tampered, and either (a) refuses to
+  // proceed past password (early abort) or (b) sends a "tampered" claim
+  // that the server returns SS03 for.
+  //
+  // ROOT CAUSE for System.loadLibrary specifically: same mechanism, but
+  // amplified — JDK core methods are routinely scanned by anti-tampering,
+  // and System.loadLibrary is one of the canonical hooks for native-load
+  // interception, so it's at the top of the watchlist.
+  //
+  // VIABLE ALTERNATIVES (deferred for future iteration):
+  //   1. Frida Stalker on libscplugin's mpi.e callback — instruments at
+  //      instruction level via JIT recompilation, no trampoline on the
+  //      function itself. Detection-resistant but ~10× slower and can
+  //      race with anti-tampering timing checks.
+  //   2. Dobby hook in libclient.so on the C++ caller of iew.mpi.e —
+  //      OmniShield manages stealth via DLCLOSE_MODULE_LIBRARY +
+  //      remapModuleMemory + dl_iterate_phdr filter. The existing
+  //      AttPayload hook (config keys attestation_payload_proto_*) lives
+  //      in this same surface and survives Snap's scans because it's
+  //      registered via OmniShield's hidden trampoline path. Adding a
+  //      pre-mpi.e hook there is feasible if/when needed.
+  //   3. Static analysis is sufficient for the protobuf schema — see
+  //      reports/argos_decompile_20260427/ARGOS_PROTOBUF_SCHEMA.md. Live
+  //      runtime visibility into the plaintext is NOT required to
+  //      validate OmniShield's coverage; the Snap-stored-state forensic
+  //      audit (`dump_snap_tokens.sh` + correlation report) already
+  //      proves end-to-end propagation of every spoofed identifier.
+  //
+  // For now: NO hooks on iew.mpi.* from the Frida side. The retry+logging
+  // scaffolding has been removed; if future work re-introduces these,
+  // route through option 2 (OmniShield Dobby) instead of Java-level
+  // Interceptor.
 
   // ─── ClientAttestationInterceptor / Vendor+Google key attestation ─────────
   // PRIOR APPROACH (removed): enumerateLoadedClassesSync + Java.use() on

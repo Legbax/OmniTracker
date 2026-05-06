@@ -572,19 +572,129 @@
   // SYSTEM PROPERTIES — __system_property_get (capture ALL, not just filtered)
   // ═══════════════════════════════════════════════════════════════════════════
 
+  // ─── Caller-module classifier (TEST 2: libclient.so independent reads) ────
+  // Snap packs libclient.so / libscplugin.so INSIDE split_config.arm64_v8a.apk
+  // (Android Bundle format). Process.findRangeByAddress returns the APK path,
+  // not the .so name, so we use Process.findModuleByAddress which resolves
+  // to the actual SONAME via the in-memory module list.
+  var callerModuleCache = {};
+  var TARGET_LIBS = ["libclient.so", "libscplugin.so"];
+  function classifyCaller(returnAddress) {
+    if (!returnAddress) return null;
+    var key = returnAddress.toString();
+    if (callerModuleCache[key] !== undefined) return callerModuleCache[key];
+    var info = null;
+    try {
+      var mod = Process.findModuleByAddress(returnAddress);
+      if (mod && mod.name) {
+        info = {
+          module: mod.name,
+          offset: returnAddress.sub(mod.base).toString()
+        };
+      } else {
+        // Fallback: range-based lookup gives us at least the APK path
+        var range = Process.findRangeByAddress(returnAddress);
+        if (range && range.file && range.file.path) {
+          info = {
+            module: range.file.path.split('/').pop(),
+            offset: returnAddress.sub(range.base).toString()
+          };
+        }
+      }
+    } catch (e) {}
+    callerModuleCache[key] = info;
+    return info;
+  }
+
+  // The 27+9 = 36 keys enumerated in CLAUDE.md / ARGOS_OMNISHIELD_ANALYSIS § 6.5
+  // (libscplugin's static surface). 2026-04-30 standalone Test 2 added ro.arch
+  // (libscplugin.so+0x1cccbc, empty/probe-only). Use this to flag NEW reads from
+  // libclient.so that aren't part of scplugin's known set — that's the gap.
+  var SCPLUGIN_KNOWN_KEYS = {
+    // 27 __system_property_get
+    "ro.product.device":1, "ro.product.manufacturer":1, "ro.product.model":1,
+    "ro.product.cpu.abilist":1, "ro.product.first_api_level":1,
+    "ro.build.version.sdk":1, "ro.build.version.release":1,
+    "ro.build.version.incremental":1, "ro.build.version.security_patch":1,
+    "ro.build.tags":1, "ro.build.user":1,
+    "ro.arch":1,
+    "dalvik.vm.isa.arm.variant":1, "dalvik.vm.isa.arm64.variant":1,
+    "dalvik.vm.isa.x86.variant":1, "dalvik.vm.isa.x86_x64.variant":1,
+    "dalvik.vm.heapsize":1, "ro.dalvik.vm.native.bridge":1,
+    "ro.boot.flash.locked":1, "ro.boot.vbmeta.device_state":1,
+    "ro.boot.verifiedbootstate":1,
+    "init.svc.adbd":1, "service.adb.root":1,
+    "persist.sys.test_harness":1, "ro.test_harness":1,
+    "ro.sf.lcd_density":1, "ro.frp.pst":1,
+    // 9 __system_property_find
+    "androVM.inited":1, "init.svc.genyd":1, "ro.genymotion.version":1,
+    "init.svc.vbox64-setup":1, "persist.nox.gps.status":1,
+    "ro.build.description":1, "ARGH":1
+    // ro.build.user + service.adb.root already in get-list above
+  };
+
   var propGetPtr = Module.findExportByName("libc.so", "__system_property_get");
   if (propGetPtr) {
     Interceptor.attach(propGetPtr, {
       onEnter: function (args) {
         this.propName = readCStr(args[0]);
         this.valueBuf = args[1];
+        this.callerInfo = classifyCaller(this.returnAddress);
       },
       onLeave: function (retval) {
+        // Existing: filtered emit by SENSITIVE_PROPS list
         if (isSensitiveProp(this.propName)) {
           var value = null;
           try { value = this.valueBuf.readCString(); } catch (e) {}
           if (isNew("SYSTEM_PROPERTY", this.propName)) {
-            emit.call(this, "SYSTEM_PROPERTY", value, { property: this.propName });
+            var meta = { property: this.propName };
+            if (this.callerInfo) {
+              meta.caller_module = this.callerInfo.module;
+              meta.caller_offset = this.callerInfo.offset;
+            }
+            emit.call(this, "SYSTEM_PROPERTY", value, meta);
+          }
+        }
+        // TEST 2: ALWAYS emit when caller is libclient.so or libscplugin.so,
+        // regardless of SENSITIVE_PROPS membership. Dedup per (module, key).
+        if (this.callerInfo && TARGET_LIBS.indexOf(this.callerInfo.module) !== -1) {
+          var dedupKey = "SYSPROP_BY_LIB:" + this.callerInfo.module + ":" + this.propName;
+          if (isNew("SYSPROP_BY_LIB", dedupKey)) {
+            var v = null;
+            try { v = this.valueBuf.readCString(); } catch (e) {}
+            emit.call(this, "SYSPROP_BY_LIB", v, {
+              property: this.propName,
+              caller_module: this.callerInfo.module,
+              caller_offset: this.callerInfo.offset,
+              in_scplugin_known_set: !!SCPLUGIN_KNOWN_KEYS[this.propName]
+            });
+          }
+        }
+      }
+    });
+  }
+
+  // Mirror the same classification on __system_property_find — anti-emulator
+  // probes go through this entry point. libclient.so calls this independently
+  // would also be a discovery.
+  var propFindPtr = Module.findExportByName("libc.so", "__system_property_find");
+  if (propFindPtr) {
+    Interceptor.attach(propFindPtr, {
+      onEnter: function (args) {
+        this.propName = readCStr(args[0]);
+        this.callerInfo = classifyCaller(this.returnAddress);
+      },
+      onLeave: function (retval) {
+        if (this.callerInfo && TARGET_LIBS.indexOf(this.callerInfo.module) !== -1) {
+          var dedupKey = "SYSPROP_FIND_BY_LIB:" + this.callerInfo.module + ":" + this.propName;
+          if (isNew("SYSPROP_FIND_BY_LIB", dedupKey)) {
+            emit.call(this, "SYSPROP_FIND_BY_LIB", retval.isNull() ? null : "<found>", {
+              property: this.propName,
+              caller_module: this.callerInfo.module,
+              caller_offset: this.callerInfo.offset,
+              found: !retval.isNull(),
+              in_scplugin_known_set: !!SCPLUGIN_KNOWN_KEYS[this.propName]
+            });
           }
         }
       }
@@ -790,83 +900,114 @@
   // PRCTL — process control (PR_SET_DUMPABLE, PR_SET_NAME detection)
   // ═══════════════════════════════════════════════════════════════════════════
 
-  var prctlPtr = Module.findExportByName("libc.so", "prctl");
-  if (prctlPtr) {
-    var PRCTL_NAMES = {
-      1: "PR_SET_PDEATHSIG", 4: "PR_SET_DUMPABLE", 3: "PR_GET_DUMPABLE",
-      15: "PR_SET_NAME", 16: "PR_GET_NAME", 22: "PR_SET_SECCOMP",
-      36: "PR_SET_NO_NEW_PRIVS", 38: "PR_GET_NO_NEW_PRIVS"
-    };
-    Interceptor.attach(prctlPtr, {
-      onEnter: function (args) {
-        this.option = args[0].toInt32();
-        this.arg2 = args[1];
-      },
-      onLeave: function (retval) {
-        var name = PRCTL_NAMES[this.option];
-        if (name && isNew("PRCTL", name)) {
-          var extra = { option: this.option, optionName: name, ret: retval.toInt32() };
-          if (this.option === 15) { // PR_SET_NAME
-            try { extra.processName = readCStr(this.arg2); } catch (e) {}
+  // PRCTL hook DISABLED by default for Snap-class targets.
+  // libferrite-launcher's anti-tamper engine periodically calls
+  //   prctl(PR_GET_NAME) and prctl(PR_GET_DUMPABLE)
+  // from un-symbolized trampolines and measures the wall-clock delta. The
+  // baseline is so tight that even an empty Interceptor.attach onEnter/onLeave
+  // adds enough overhead to be detected, after which ferrite fires SIGSEGV
+  // ("Bad access due to invalid address" in Thread-4) ~3-5s after attach.
+  // Enable with `globalThis._OT_PRCTL_HOOK = true` for non-anti-tamper targets.
+  // Re-enabled by default after the scanner-recursion root-cause fix. The
+  // "ferrite anti-tamper" attribution was speculation; opt-out via
+  // `globalThis._OT_PRCTL_HOOK = false` if a target proves sensitive.
+  if (globalThis._OT_PRCTL_HOOK !== false) {
+    var prctlPtr = Module.findExportByName("libc.so", "prctl");
+    if (prctlPtr) {
+      var PRCTL_NAMES = {
+        1: "PR_SET_PDEATHSIG", 4: "PR_SET_DUMPABLE", 3: "PR_GET_DUMPABLE",
+        15: "PR_SET_NAME", 16: "PR_GET_NAME", 22: "PR_SET_SECCOMP",
+        36: "PR_SET_NO_NEW_PRIVS", 38: "PR_GET_NO_NEW_PRIVS"
+      };
+      Interceptor.attach(prctlPtr, {
+        onEnter: function (args) {
+          this.option = args[0].toInt32();
+          this.arg2 = args[1];
+        },
+        onLeave: function (retval) {
+          var name = PRCTL_NAMES[this.option];
+          if (name && isNew("PRCTL", name)) {
+            var extra = { option: this.option, optionName: name, ret: retval.toInt32() };
+            if (this.option === 15) { try { extra.processName = readCStr(this.arg2); } catch (e) {} }
+            emit.call(this, "PRCTL", name, extra);
           }
-          emit.call(this, "PRCTL", name, extra);
         }
-      }
-    });
+      });
+    }
+  } else {
+    emit("__INIT__", "prctl hook DISABLED (opt-out via _OT_PRCTL_HOOK=false)");
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
   // GETPID / GETPPID / GETTID — process identity queries
   // ═══════════════════════════════════════════════════════════════════════════
 
-  var getpidPtr = Module.findExportByName("libc.so", "getpid");
-  if (getpidPtr) {
-    Interceptor.attach(getpidPtr, {
-      onLeave: function (retval) {
-        if (isNew("GETPID", "call")) {
-          emit.call(this, "GETPID", retval.toInt32().toString());
+  // GETPID/GETPPID hooks DISABLED by default for the same reason as prctl:
+  // libferrite-launcher's anti-tamper engine uses getpid() as a timing
+  // baseline (it's the cheapest syscall ABI-wise). Empirically Snap crashes
+  // ~10-20s after attach with SIGSEGV when these hooks are active, even when
+  // the actual emit() is throttled — Frida's Interceptor trampoline alone
+  // adds enough overhead. Enable with `globalThis._OT_PID_HOOKS = true` for
+  // non-anti-tamper targets.
+  // Re-enabled by default after the scanner-recursion root-cause fix. Opt-out
+  // via `globalThis._OT_PID_HOOKS = false` if a target proves sensitive.
+  if (globalThis._OT_PID_HOOKS !== false) {
+    var getpidPtr = Module.findExportByName("libc.so", "getpid");
+    if (getpidPtr) {
+      Interceptor.attach(getpidPtr, {
+        onLeave: function (retval) {
+          if (isNew("GETPID", "call")) emit.call(this, "GETPID", retval.toInt32().toString());
         }
-      }
-    });
-  }
-
-  var getppidPtr = Module.findExportByName("libc.so", "getppid");
-  if (getppidPtr) {
-    Interceptor.attach(getppidPtr, {
-      onLeave: function (retval) {
-        if (isNew("GETPPID", "call")) {
-          emit.call(this, "GETPPID", retval.toInt32().toString(), {
-            note: "Parent PID — used for Zygote/tracer detection"
-          });
+      });
+    }
+    var getppidPtr = Module.findExportByName("libc.so", "getppid");
+    if (getppidPtr) {
+      Interceptor.attach(getppidPtr, {
+        onLeave: function (retval) {
+          if (isNew("GETPPID", "call")) {
+            emit.call(this, "GETPPID", retval.toInt32().toString(),
+              { note: "Parent PID — used for Zygote/tracer detection" });
+          }
         }
-      }
-    });
+      });
+    }
+  } else {
+    emit("__INIT__", "getpid/getppid hooks DISABLED (opt-out via _OT_PID_HOOKS=false)");
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
   // PTRACE — anti-debugging detection
   // ═══════════════════════════════════════════════════════════════════════════
 
-  var ptracePtr = Module.findExportByName("libc.so", "ptrace");
-  if (ptracePtr) {
-    Interceptor.attach(ptracePtr, {
-      onEnter: function (args) {
-        this.request = args[0].toInt32();
-        this.pid = args[1].toInt32();
-      },
-      onLeave: function (retval) {
-        var PTRACE_NAMES = { 0: "TRACEME", 1: "PEEKTEXT", 2: "PEEKDATA",
-          16: "ATTACH", 17: "DETACH", 24: "SEIZE" };
-        var name = PTRACE_NAMES[this.request] || "req=" + this.request;
-        if (isNew("PTRACE", name + ":" + this.pid)) {
-          emit.call(this, "PTRACE", name, {
-            request: this.request, pid: this.pid,
-            ret: retval.toInt32(),
-            note: "Anti-debug: PTRACE_TRACEME prevents other debuggers"
-          });
+  // ptrace hook DISABLED — same anti-tamper-trigger family as prctl/getpid.
+  // ferrite uses ptrace(PTRACE_TRACEME) at boot to detect debuggers; if our
+  // hook adds detectable overhead it triggers SIGSEGV. Opt-in via
+  // globalThis._OT_PTRACE_HOOK = true.
+  // Re-enabled by default after the scanner-recursion root-cause fix. Opt-out
+  // via `globalThis._OT_PTRACE_HOOK = false` if a target proves sensitive.
+  if (globalThis._OT_PTRACE_HOOK !== false) {
+    var ptracePtr = Module.findExportByName("libc.so", "ptrace");
+    if (ptracePtr) {
+      Interceptor.attach(ptracePtr, {
+        onEnter: function (args) {
+          this.request = args[0].toInt32();
+          this.pid = args[1].toInt32();
+        },
+        onLeave: function (retval) {
+          var PTRACE_NAMES = { 0: "TRACEME", 1: "PEEKTEXT", 2: "PEEKDATA",
+            16: "ATTACH", 17: "DETACH", 24: "SEIZE" };
+          var name = PTRACE_NAMES[this.request] || "req=" + this.request;
+          if (isNew("PTRACE", name + ":" + this.pid)) {
+            emit.call(this, "PTRACE", name, {
+              request: this.request, pid: this.pid, ret: retval.toInt32(),
+              note: "Anti-debug: PTRACE_TRACEME prevents other debuggers"
+            });
+          }
         }
-      }
-    });
+      });
+    }
+  } else {
+    emit("__INIT__", "ptrace hook DISABLED (opt-out via _OT_PTRACE_HOOK=false)");
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -1057,6 +1198,114 @@
         }
       });
     }
+    // posix_spawn / posix_spawnp — used by Snap & GMS to launch helper procs.
+    // Captures the executable path which fork/vfork/clone don't expose.
+    ["posix_spawn", "posix_spawnp"].forEach(function (sym) {
+      var p = Module.findExportByName("libc.so", sym);
+      if (!p) return;
+      Interceptor.attach(p, {
+        onEnter: function (args) {
+          // posix_spawn(pid_t* pid, const char* path, ...)
+          try { this._path = args[1].readCString() || "?"; } catch (e) { this._path = "?"; }
+          this._pidPtr = args[0];
+        },
+        onLeave: function (retval) {
+          if (retval.toInt32() !== 0) return;  // failed
+          var childPid = -1;
+          try { if (this._pidPtr && !this._pidPtr.isNull()) childPid = this._pidPtr.readS32(); } catch (e) {}
+          if (isNew("PROC_SPAWN", this._path + ":" + childPid)) {
+            emit.call(this, "PROC_SPAWN", this._path, {
+              pid: childPid,
+              syscall: sym,
+              note: "Helper-process spawn — child does NOT inherit Frida hooks"
+            });
+          }
+        }
+      });
+    });
+  })();
+
+  // ─── syscall(2) wrapper trace — DISABLED by default ──────────────────────
+  // Empirically this hook triggered Snap's libferrite-launcher anti-tamper:
+  // ferrite calls syscall(SYS_getpid) periodically to check for timing
+  // anomalies; our backtrace/symbol-resolution overhead inside the
+  // Interceptor.attach onEnter is detectable and causes Snap to crash with
+  // SIGSEGV ("Bad access due to invalid address" in Thread-4) ~1s after
+  // attach. Disabled until we move to a Stalker-based, allocation-free
+  // sampler. Set globalThis._OT_SYSCALL_HOOK = true to force-enable for
+  // diagnostic runs against non-Snap targets.
+  if (globalThis._OT_SYSCALL_HOOK !== true) {
+    emit("__INIT__", "syscall(2) wrapper hook DISABLED (libferrite anti-tamper trigger)");
+  } else
+  (function hookSyscall() {
+    var syscallPtr = Module.findExportByName("libc.so", "syscall");
+    if (!syscallPtr) {
+      emit("__INIT__", "libc.syscall not exported — syscall(2) wrapper trace inactive");
+      return;
+    }
+    // arm64 syscall numbers worth tracing. Excludes:
+    //   nr=56 openat: redundant with our libc.openat hook AND would re-enter
+    //                 from emit()/DebugSymbol.fromAddress reads on /proc/self/maps.
+    //   nr=63 read, nr=64 write, nr=222 mmap: too high-frequency.
+    var TRACED_NR = {
+      29:  "ioctl",
+      117: "ptrace",
+      167: "prctl",
+      203: "connect",
+      212: "recvmsg",
+      278: "getrandom",
+      174: "getuid",  172: "getpid",   178: "gettid",
+      170: "sethostname"
+    };
+    // Per-thread re-entrancy guard: emit() itself does file I/O for symbol
+    // resolution, so a traced nr could re-enter via Frida's runtime. Bail out
+    // if we're already inside the hook on this thread.
+    var inSyscallTls = {};
+    // Keyed dedup that includes the first arg (often a path, fd, or clockid),
+    // so we don't collapse all calls of the same nr into one event.
+    var sysDedup = {};
+    function sysIsNew(nr, arg1Key) {
+      var key = nr + ":" + (arg1Key || "");
+      if (sysDedup[key]) return false;
+      sysDedup[key] = true;
+      return true;
+    }
+    function _firstArgContext(nr, args) {
+      // For path-bearing syscalls, sniff the first arg as a CString.
+      // For fd-bearing ones, render the int. Failures fall back to "*".
+      try {
+        if (nr === 29) return "fd=" + args[1].toInt32();           // ioctl(fd, req)
+        if (nr === 117) return "req=" + args[1].toInt32();         // ptrace(req, ...)
+        if (nr === 203) return "fd=" + args[1].toInt32();          // connect(fd, addr, len)
+        if (nr === 212) return "fd=" + args[1].toInt32();          // recvmsg(fd, msg, flags)
+      } catch (e) {}
+      return "*";
+    }
+    Interceptor.attach(syscallPtr, {
+      onEnter: function (args) {
+        var tid = Process.getCurrentThreadId();
+        if (inSyscallTls[tid]) return;
+        try {
+          var nr = args[0].toInt32();
+          var name = TRACED_NR[nr];
+          if (!name) return;
+          var ctx = _firstArgContext(nr, args);
+          if (!sysIsNew(nr, ctx)) return;
+          inSyscallTls[tid] = true;
+          try {
+            emit.call(this, "SYSCALL_DIRECT", "nr=" + nr + " (" + name + ") " + ctx, {
+              nr: nr, name: name, ctx: ctx,
+              note: "libc.syscall() wrapper call — does NOT catch inline SVC #0 vendor bypasses"
+            });
+          } finally {
+            inSyscallTls[tid] = false;
+          }
+        } catch (e) {
+          inSyscallTls[tid] = false;
+        }
+      }
+    });
+    emit("__INIT__", "syscall(2) wrapper hook installed (10 numbers; openat/read/write excluded)");
   })();
 
   // ─── USB descriptor snapshot — VID/PID leaks SoC + USB controller vendor ─
@@ -1246,6 +1495,196 @@
       });
     }
   })();
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // RegisterNatives — JNI native method registration trace
+  // Snap's loadable native libs (libsigx, libscplugin, libferrite-*, etc.)
+  // register Java native methods via JNIEnv->RegisterNatives. The actual
+  // implementation in ART is the C++ symbol art::JNI::RegisterNatives.
+  // Hooking it gives us a per-class inventory of every native method
+  // exposed to Java: name, signature, and the C function pointer (which
+  // we can correlate with later Interceptor.attach hits).
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  (function hookRegisterNatives() {
+    var libart = "libart.so";
+    // The mangled name varies between Android versions. Try the canonical A11/12/13
+    // variant first; fall back to enumerateSymbols substring match if not found.
+    // The previous "DecodeMethodIdInternal" probe was removed — it could have
+    // resolved on some builds and made us hook the wrong function, producing
+    // garbage JNI_REGISTER_NATIVES events with bogus method counts.
+    var rnPtr = null;
+    try {
+      rnPtr = Module.findExportByName(libart,
+        "_ZN3art3JNI15RegisterNativesEP7_JNIEnvP7_jclassPK15JNINativeMethodi");
+    } catch (e) {}
+    if (!rnPtr) {
+      try {
+        var syms = Module.enumerateSymbols(libart);
+        for (var j = 0; j < syms.length; j++) {
+          var nm = syms[j].name;
+          // Require both fragments AND the JNINativeMethod pointer-type marker
+          // to avoid matching unrelated JNI helpers.
+          if (nm && nm.indexOf("art3JNI") !== -1 &&
+              nm.indexOf("RegisterNatives") !== -1 &&
+              nm.indexOf("JNINativeMethod") !== -1) {
+            rnPtr = syms[j].address; break;
+          }
+        }
+      } catch (eEnum) {}
+    }
+    if (!rnPtr) {
+      emit("__INIT__", "art::JNI::RegisterNatives not found — JNI registration trace inactive");
+      return;
+    }
+
+    // Resolve helper symbols once — we need GetClassDescriptor or the env
+    // pointer to humanise class names. We fall back to printing the raw
+    // jclass pointer if the helper isn't reachable (still useful for dedup).
+    var jniClassNameDedup = {};
+
+    Interceptor.attach(rnPtr, {
+      // Signature: jint RegisterNatives(JNIEnv* env, jclass clazz,
+      //                                 const JNINativeMethod* methods,
+      //                                 jint nMethods)
+      onEnter: function (args) {
+        try {
+          var clazz   = args[1];
+          var methods = args[2];
+          var n       = args[3].toInt32 ? args[3].toInt32() : 0;
+          if (!methods || methods.isNull() || n <= 0 || n > 4096) return;
+
+          var clsKey = clazz ? clazz.toString() : "?";
+          // Dedup: only emit once per (jclass, method-count) combo per session.
+          var dedupKey = clsKey + ":" + n;
+          if (jniClassNameDedup[dedupKey]) return;
+          jniClassNameDedup[dedupKey] = true;
+
+          // Each JNINativeMethod entry is 3 pointers: name(char*), sig(char*), fnPtr
+          var entrySize = Process.pointerSize * 3;
+          var sample = [];
+          var maxSamples = Math.min(n, 8);  // cap output to first 8 methods
+          for (var i = 0; i < maxSamples; i++) {
+            try {
+              var entry = methods.add(i * entrySize);
+              var namePtr = entry.readPointer();
+              var sigPtr  = entry.add(Process.pointerSize).readPointer();
+              var fnPtr   = entry.add(Process.pointerSize * 2).readPointer();
+              var name = namePtr && !namePtr.isNull() ? namePtr.readCString() : "?";
+              var sig  = sigPtr  && !sigPtr.isNull()  ? sigPtr.readCString()  : "?";
+              sample.push(name + sig + " @ " + fnPtr);
+            } catch (eEntry) { sample.push("<unreadable@" + i + ">"); }
+          }
+          emit.call(this, "JNI_REGISTER_NATIVES", "n=" + n + " jclass=" + clsKey, {
+            count: n,
+            jclass: clsKey,
+            methods: sample,
+            note: "Each entry: name+JNI-signature @ native-fn pointer. Use Interceptor.attach on the pointer to follow per-method calls."
+          });
+        } catch (e) {}
+      }
+    });
+
+    emit("__INIT__", "art::JNI::RegisterNatives hook installed");
+
+    // ── Retro-scan for already-registered native methods (OPT-IN) ─────────
+    // In attach mode the libs loaded before our agent — RegisterNatives has
+    // already returned and we miss everything. A retro-walk via reflection
+    // could recover the inventory, BUT enumerating 5000+ classes and calling
+    // getDeclaredMethods() on each blocks the agent's JS thread for 20-40s,
+    // during which Snap's own Java callbacks hang and the app appears frozen.
+    // Disabled by default. Set globalThis._OT_JNI_RETRO_WALK = true from a
+    // patched copy of this file to enable for diagnostic runs.
+    if (globalThis._OT_JNI_RETRO_WALK === true) {
+      setTimeout(function () {
+        try {
+          if (typeof Java === "undefined" || !Java.available) return;
+          Java.perform(function () {
+            try {
+              var classes = Java.enumerateLoadedClassesSync();
+              var Modifier = Java.use("java.lang.reflect.Modifier");
+              var seen = {};
+              var maxClasses = 1500;     // hard cap on iteration
+              var emitted = 0, maxEmitted = 60;
+              for (var i = 0; i < Math.min(classes.length, maxClasses); i++) {
+                var clsName = classes[i];
+                if (clsName.indexOf("java.") === 0 ||
+                    clsName.indexOf("javax.") === 0 ||
+                    clsName.indexOf("android.") === 0 ||
+                    clsName.indexOf("dalvik.") === 0 ||
+                    clsName.indexOf("libcore.") === 0 ||
+                    clsName.indexOf("sun.") === 0 ||
+                    clsName.indexOf("kotlin.") === 0 ||
+                    clsName.indexOf("kotlinx.") === 0) continue;
+                if (seen[clsName]) continue;
+                seen[clsName] = true;
+                try {
+                  var clsObj = Java.use(clsName);
+                  var methods = clsObj.class.getDeclaredMethods();
+                  var natives = [];
+                  for (var m = 0; m < methods.length; m++) {
+                    try {
+                      if (Modifier.isNative(methods[m].getModifiers())) {
+                        natives.push(methods[m].getName() + " " + methods[m].toString().substring(0, 120));
+                      }
+                    } catch (eM) {}
+                    if (natives.length >= 8) break;
+                  }
+                  if (natives.length > 0) {
+                    emit("JNI_REGISTER_NATIVES_RETRO", "class=" + clsName + " n=" + natives.length, {
+                      class: clsName, methods: natives,
+                      note: "Already-registered native methods (OPT-IN scan; no C fnPtr available)"
+                    });
+                    emitted++;
+                    if (emitted >= maxEmitted) break;
+                  }
+                } catch (eCls) {}
+              }
+              emit("__INIT__", "JNI retro-scan (opt-in) done — " + emitted + " classes with native methods");
+            } catch (ePerform) {}
+          });
+        } catch (eOuter) {}
+      }, 8000);  // longer delay so we don't compete with Snap's startup
+    }
+  })();
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SCPLUGIN VERIFICATION OBSERVER — REVERTED (2026-04-27)
+  // ═══════════════════════════════════════════════════════════════════════════
+  // The previous version of this file shipped a 9-hook libc observer
+  // (__system_property_get/_find, open, openat, fdopendir, readdir,
+  // dl_iterate_phdr, getauxval, syscall) gated by caller-is-inside-libscplugin.
+  // It broke Snap signup deterministically: Snap aborted at the password-
+  // submit step (where the first attestation would fire) BEFORE libscplugin
+  // even loaded — confirmed via `cat /proc/<snap_pid>/maps | grep scplugin` =
+  // 0 matches. Root cause was double-hooking on libc functions already
+  // instrumented above (open, openat, __system_property_get, dl_iterate_phdr)
+  // plus a NEW hook on `syscall` — anti-tampering libraries explicitly check
+  // that `syscall` is unhooked because it's the canonical bypass for libc
+  // hooks; finding it trampolined is a deterministic abort signal.
+  //
+  // Lesson: Frida Interceptor.attach on libc.so is NOT free — it modifies
+  // the prologue with a trampoline that's detectable by even basic shape
+  // checks (first 4 bytes of the function). Adding more libc hooks past
+  // what's already there increases the detection surface linearly.
+  //
+  // Path forward (if scplugin verification visibility is still wanted):
+  //   1. EXTEND existing layer2 hooks (don't duplicate). The existing
+  //      __system_property_get/dl_iterate_phdr/open/openat already log
+  //      events; just add a "caller_in_scplugin" boolean to the existing
+  //      payload by checking returnAddress against a lazily-resolved
+  //      libscplugin range. No new trampolines.
+  //   2. NEVER hook `syscall`. If we want to see ptrace/prctl direct
+  //      syscalls, hook the libc wrappers ptrace/prctl instead (already in
+  //      layer2 and accepted by Snap).
+  //   3. Stalker (Frida's slower-but-stealthier instrumentation API) for
+  //      observation-only on libscplugin's own code — but its overhead is
+  //      ~10x and it can race with anti-tampering timing checks.
+  //
+  // For now, scplugin verification visibility is deferred. The Java-side
+  // hooks added to layer1_java.js (iew.mpi.e/iew.mpi.f/System.loadLibrary)
+  // are PRESERVED and remain useful — they give us the AttestationPayload
+  // plaintext + ciphertext without touching any libc prologue.
 
   // ═══════════════════════════════════════════════════════════════════════════
   // DONE

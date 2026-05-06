@@ -41,6 +41,21 @@ from pathlib import Path
 # Order matters: longest / most specific needles come first so a later, shorter
 # needle does not see a substring that has already been replaced.
 TARGETED_REPLACEMENTS: list[tuple[bytes, bytes]] = [
+    # Runtime template that builds the memfd name. Frida composes the visible
+    # /memfd:frida-agent-64.so by substituting <arch> in this literal at run
+    # time, so the *expanded* form ("frida-agent-64.so") never appears in the
+    # binary as such — patching only the expanded form is a no-op for the leak
+    # that Snapchat actually reads from /proc/self/maps. This template MUST be
+    # patched too. Same applies to "libfrida-agent-raw.so" and the agent-
+    # container env-var prefix.
+    (b"frida-agent-<arch>.so", b"linux-agent-<arch>.so"),
+    (b"libfrida-agent-raw.so", b"liblinux-agent-raw.so"),
+    # NOTE: do NOT patch "frida-agent-container" — appears to be the prefix of
+    # an internal env-var or config key consumed by the helper-spawn path. When
+    # patched, the binder layer fails with "timeout was reached" during
+    # script.load(), suggesting the agent's own RPC/helper coordination breaks.
+    # The string is internal (not visible in /proc/self/maps) so leaving it is
+    # not a detection vector.
     # Agent / helper .so names with the .so suffix. These ARE visible to the
     # target process via /proc/self/maps after injection (e.g.
     # /memfd:frida-agent-64.so). They have to be replaced too — keeping them
@@ -67,10 +82,33 @@ TARGETED_REPLACEMENTS: list[tuple[bytes, bytes]] = [
     # cosmetic "cause" string in art::ThreadList::SuspendAll calls — those
     # don't care about the value, so blanket replacement is safe.
     (b'"frida"',              b'"linux"'),
+    # ──────────────────────────────────────────────────────────────────────
+    # DISABLED: QuickJS atom patch (b'\x0afrida' -> b'\x0alinux')
+    # ──────────────────────────────────────────────────────────────────────
+    # The atom `frida` in frida-java-bridge's QuickJS bytecode is the dex
+    # file prefix (creating /data/data/<target>/cache/frida<rand>.dex which
+    # Snap can detect). Patching the atom DOES rename the dex to linux*.dex
+    # but it ALSO breaks something internal in frida-java-bridge that causes
+    # ART to crash with SIGSEGV in art::FindOatMethodFor when Snap forks
+    # Thread-4 for ferrite anti-tamper checks. Hypothesis: the atom is
+    # interned and referenced from compiled JS bytecode for an internal
+    # method/property name; renaming corrupts the lookup.
+    #
+    # Trade-off accepted: Snap will see frida<rand>.dex and may detect us
+    # via the cache directory listing — but the process won't crash.
+    # Mitigation path: have susfs hide /data/data/com.snapchat.android/cache
+    # entries that match frida*.dex, OR find a non-atom way to override the
+    # dex prefix from inside frida-java-bridge config.
+    # (b'\x0afrida',            b'\x0alinux'),
     # Thread names exposed via /proc/PID/task/*/comm.
     (b"frida-helper-loop",    b"linux-helper-loop"),
     (b"frida-main-loop",      b"linux-main-loop"),
     (b"gum-js-loop",          b"lib-js-loop"),
+    # NOTE: do NOT patch the bare "frida-agent" literal. It appears once in the
+    # loader's error message but is also used internally as a lookup key inside
+    # the agent runtime — replacing it breaks Frida's own JS host-session code
+    # (queryIntentActivities returns null on enumerate_processes/applications).
+    # The error-message leak is acceptable; it only fires on failed injection.
     # Abstract Unix socket prefix exposed in /proc/net/unix as @/frida-<uuid>.
     # The standalone null-terminated literal is concatenated with a UUID at
     # runtime to build the socket name (still created even in TCP listen mode).

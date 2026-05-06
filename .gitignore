@@ -9,7 +9,9 @@ captures/
 *.jsonl
 *.log
 full_dump.txt
+snapchat_full_dump.txt
 Report.txt
+scratch/libclient_audit/
 
 # --- Heavy binaries (downloadable from upstream) ---
 bin/frida-server*

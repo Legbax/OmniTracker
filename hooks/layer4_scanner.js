@@ -357,35 +357,106 @@
       }
     }
 
-    // --- Telephony carrier coherence (invariant #44 MCC/MNC US table) ---
-    // US_CARRIERS[]: T-Mobile 310260, AT&T 310410, Verizon 311480, US Cellular 311580
-    var US_MNC_WHITELIST = { "310260": "T-Mobile", "310410": "AT&T",
-                             "311480": "Verizon", "311580": "US Cellular" };
-    var simNumeric = propValues["gsm.sim.operator.numeric"];
-    var netNumeric = propValues["gsm.operator.numeric"];
-    var simIso = propValues["gsm.sim.operator.iso-country"];
-    var netIso = propValues["gsm.operator.iso-country"];
-    var telMismatches = [];
-    if (simNumeric && !US_MNC_WHITELIST[simNumeric]) {
-      telMismatches.push("gsm.sim.operator.numeric=" + simNumeric + " (not in US_CARRIERS table)");
+    // --- Telephony carrier coherence (country-agnostic) ---
+    // Strategy: detect the *claimed* country from iso-country, then check the
+    // MCC/MNC pair belongs to a known operator of that country AND that SIM
+    // and network agree. If iso-country is unknown to us, fall back to plain
+    // SIM-vs-network coherence (don't emit a leak just because the country
+    // isn't in our table).
+    //
+    // OmniShield mode awareness: pre-v1.53 forced persona-US (claimed iso=us
+    // and synthesized 310260/310410/311480/311580). v1.53 "Chile Simplify"
+    // keeps the real CL SIM/iso-country to avoid divergences with the GPS
+    // and Argos device-data. Both are valid; the check here only fires when
+    // the persona itself is internally inconsistent.
+    var CARRIERS_BY_COUNTRY = {
+      "us": { "310260":"T-Mobile", "310410":"AT&T",
+              "311480":"Verizon",  "311580":"US Cellular" },
+      "cl": { "73001":"Entel",     "73002":"Movistar",
+              "73003":"Movistar",  "73004":"Nextel",
+              "73009":"Claro/VTR", "73010":"Entel",
+              "73011":"WOM",       "73099":"WOM" }
+    };
+
+    // Normalize "x,x" duplicates that some readers return concatenated.
+    function _firstToken(s) {
+      if (!s) return s;
+      var parts = String(s).split(",");
+      // pick the first non-empty token
+      for (var i = 0; i < parts.length; i++) {
+        if (parts[i] && parts[i] !== "00000") return parts[i];
+      }
+      return parts[0];
     }
-    if (netNumeric && !US_MNC_WHITELIST[netNumeric]) {
-      telMismatches.push("gsm.operator.numeric=" + netNumeric + " (not in US_CARRIERS table)");
+    var simNumeric = _firstToken(propValues["gsm.sim.operator.numeric"]);
+    var netNumeric = _firstToken(propValues["gsm.operator.numeric"]);
+    var simIso     = _firstToken(propValues["gsm.sim.operator.iso-country"]);
+    var netIso     = _firstToken(propValues["gsm.operator.iso-country"]);
+    if (simIso) simIso = simIso.toLowerCase();
+    if (netIso) netIso = netIso.toLowerCase();
+
+    // Decide which country table to validate against.
+    // Override possible via globalThis._OT_EXPECTED_COUNTRY = "us" / "cl" / ...
+    var expectedCountry = (typeof globalThis._OT_EXPECTED_COUNTRY === "string")
+      ? globalThis._OT_EXPECTED_COUNTRY.toLowerCase()
+      : (simIso || netIso || null);
+    var carrierTable = expectedCountry ? CARRIERS_BY_COUNTRY[expectedCountry] : null;
+
+    var telMismatches = [];
+    if (carrierTable) {
+      if (simNumeric && !carrierTable[simNumeric]) {
+        telMismatches.push("gsm.sim.operator.numeric=" + simNumeric +
+                           " (not a known " + expectedCountry.toUpperCase() + " operator)");
+      }
+      if (netNumeric && !carrierTable[netNumeric]) {
+        telMismatches.push("gsm.operator.numeric=" + netNumeric +
+                           " (not a known " + expectedCountry.toUpperCase() + " operator)");
+      }
     }
     if (simNumeric && netNumeric && simNumeric !== netNumeric) {
-      telMismatches.push("SIM/network MCC+MNC mismatch: sim=" + simNumeric + " net=" + netNumeric);
+      telMismatches.push("SIM/network MCC+MNC divergence: sim=" + simNumeric + " net=" + netNumeric);
     }
-    if (simIso && simIso.toLowerCase() !== "us") {
-      telMismatches.push("gsm.sim.operator.iso-country=" + simIso + " (expected 'us')");
+    if (expectedCountry && simIso && simIso !== expectedCountry) {
+      telMismatches.push("gsm.sim.operator.iso-country=" + simIso +
+                         " (expected '" + expectedCountry + "')");
     }
-    if (netIso && netIso.toLowerCase() !== "us") {
-      telMismatches.push("gsm.operator.iso-country=" + netIso + " (expected 'us')");
+    if (expectedCountry && netIso && netIso !== expectedCountry) {
+      telMismatches.push("gsm.operator.iso-country=" + netIso +
+                         " (expected '" + expectedCountry + "')");
+    }
+    if (simIso && netIso && simIso !== netIso) {
+      telMismatches.push("SIM iso-country=" + simIso +
+                         " diverges from network iso-country=" + netIso);
     }
     if (telMismatches.length > 0) {
       emit("COHERENCE_TELEPHONY_LEAK",
-        telMismatches.length + " carrier field(s) incoherent with US_CARRIERS table", {
+        telMismatches.length + " carrier field(s) incoherent with persona '" +
+        (expectedCountry || "unknown") + "'", {
         mismatches: telMismatches,
-        note: "OmniShield invariant #44 broken — seed-derived MCC/MNC must match US_CARRIERS entry"
+        expectedCountry: expectedCountry,
+        note: "Persona detected from iso-country (override via globalThis._OT_EXPECTED_COUNTRY). " +
+              "All MCC/MNC + iso-country fields must match the same persona; SIM and network must agree."
+      });
+    } else if (carrierTable) {
+      // Real validation passed (MCC matched a known operator of the expected country).
+      emit("COHERENCE_TELEPHONY_OK",
+        "carrier coherent with persona '" + expectedCountry +
+        "' (sim=" + (simNumeric||"?") + " net=" + (netNumeric||"?") +
+        " iso=" + (simIso||"?") + ")", {
+        expectedCountry: expectedCountry,
+        operator: carrierTable[simNumeric] || carrierTable[netNumeric] || "?"
+      });
+    } else {
+      // No carrier table for the detected country — internal coherence holds
+      // (SIM/net/iso aligned with each other) but we couldn't validate the
+      // operator against a known whitelist. Distinct event so operators know
+      // we didn't actually verify.
+      emit("COHERENCE_TELEPHONY_UNKNOWN",
+        "no carrier table for persona '" + (expectedCountry || "unknown") +
+        "' — internal coherence OK (sim=" + (simNumeric||"?") +
+        " net=" + (netNumeric||"?") + " iso=" + (simIso||"?") + ")", {
+        expectedCountry: expectedCountry,
+        note: "Add this country to CARRIERS_BY_COUNTRY for full validation."
       });
     }
 
@@ -736,24 +807,14 @@
   // 9. ART DEOPTIMIZATION PROBE — A13+ can force methods back to interpreter
   // ═══════════════════════════════════════════════════════════════════════════
 
-  Java.perform(function () {
-    try {
-      var Debug = Java.use("android.os.Debug");
-      // If android.os.Debug.isDebuggerConnected is frequently queried, apps
-      // are probing for instrumentation — log the fact.
-      hookIfExists(Debug, "isDebuggerConnected", function () {
-        emit("SCANNER_DEBUGGER_PROBE", "isDebuggerConnected()", {
-          method: "android.os.Debug.isDebuggerConnected()",
-          note: "App queried debugger state — anti-instrumentation probe"
-        });
-        return Debug.isDebuggerConnected();
-      });
-    } catch (e) {}
-
-    function hookIfExists(cls, name, impl) {
-      try { cls[name].implementation = impl; } catch (e) {}
-    }
-  });
+  // android.os.Debug.isDebuggerConnected hook DISABLED.
+  // Snap calls this frequently (ferrite anti-debug probe). Wrapping it via
+  // Java.use(...).implementation = ... triggers SIGSEGV in Thread-4 within
+  // ~7s of attach when scanner+java+native are loaded together, even with
+  // the recursion-safe `this.isDebuggerConnected()` pattern (which doesn't
+  // reliably work for static methods in Frida's Java bridge). The signal
+  // is not load-bearing for our analysis — Snap's Argos events already
+  // surface the anti-debug intent.
 
   // ═══════════════════════════════════════════════════════════════════════════
   // 10. SYSTEM_SERVER BINDER REACHABILITY — confirms Binder is open to us

@@ -1113,6 +1113,67 @@
   // This runs inside the same ioctl hook context but we also add a Java-level hook
   // if the binder layer is loaded in a Java context
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // libbinder_ndk (AIBinder_*) — captures NDK-style binder calls (GMS, Play
+  // Integrity, ARGOS attestation, Cronet) that bypass the legacy ioctl path.
+  // The classic ioctl hook above sees fd-level transactions; AIBinder_transact
+  // gives us an interface descriptor + tx code BEFORE the marshalling, which
+  // is much more useful for naming Snap's gRPC/attestation calls.
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  (function hookAIBinder() {
+    var libNdk = "libbinder_ndk.so";
+    var transactPtr = Module.findExportByName(libNdk, "AIBinder_transact");
+    var getIfacePtr = Module.findExportByName(libNdk, "AIBinder_getClass");
+    var classGetDescPtr = Module.findExportByName(libNdk, "AIBinder_Class_getDescriptor");
+
+    if (!transactPtr) {
+      emit("__INIT__", "AIBinder_transact not found — libbinder_ndk hook inactive");
+      return;
+    }
+
+    var getClassFn = getIfacePtr ? new NativeFunction(getIfacePtr, "pointer", ["pointer"]) : null;
+    var classGetDescFn = classGetDescPtr
+      ? new NativeFunction(classGetDescPtr, "pointer", ["pointer"]) : null;
+
+    // NO dedup on AIBinder. Argos / Play Integrity / TIVS make repeated
+    // transactions on the same (iface,code) — we want to see the bursts and
+    // timing, not collapse them to the first hit. The legacy ioctl path has
+    // its own per-tx dedup; the NDK path stays raw.
+
+    Interceptor.attach(transactPtr, {
+      // signature: int AIBinder_transact(AIBinder*, transaction_code_t code,
+      //                                  AParcel** in, AParcel** out, binder_flags_t flags)
+      onEnter: function (args) {
+        try {
+          var binderPtr = args[0];
+          var code      = args[1].toUInt32();   // transaction_code_t is uint32_t
+          var iface     = "?";
+          if (binderPtr && !binderPtr.isNull() && getClassFn && classGetDescFn) {
+            try {
+              var clsPtr = getClassFn(binderPtr);
+              if (clsPtr && !clsPtr.isNull()) {
+                var descPtr = classGetDescFn(clsPtr);
+                if (descPtr && !descPtr.isNull()) {
+                  iface = descPtr.readCString() || "?";
+                }
+              }
+            } catch (eIface) {}
+          }
+          this._iface = iface;
+          this._code  = code;
+          emit("AIBINDER_TRANSACT", iface + ":code=" + code, {
+            interface: iface,
+            code: code,
+            note: "libbinder_ndk NDK-style binder call (GMS / Play Integrity / Cronet path)"
+          });
+        } catch (e) {}
+      }
+    });
+
+    emit("__INIT__", "AIBinder hooks loaded (libbinder_ndk.AIBinder_transact)");
+  })();
+
   // ─── Done ─────────────────────────────────────────────────────────────────
 
   send({ layer: "binder", type: "__INIT__", value: "Layer 3 (Binder v4) hooks loaded — Telephony, Location, GAID, AppSetID, OAID, GSF/ContentProvider, ISub, KeyStore/KeyStore2, SmsRetriever, Battery, DeviceIdPolicy, Netd, Fingerprint, Biometric, ActivityMgr, CarrierConfig, UsageStats, + A13+: UwbAdapter, NfcAdapter, HealthConnect, AdServices, AdId, AppSetId, PackageInstaller, NetworkStats, EuiccController, ImsRegistration, Camera2Service, InputManager, UsbManager, CompanionDevice, RoleManager, PermissionManager, ContextHub + BC_REPLY scanner (32+64 bit, dual String16+String8) + SSAID replacement + attach-mode fd pre-population + runtime TRANSACTION_* reflection + Snap endpoint/protobuf scanner (TIVS/Valis/Janus/Gateway/PhoneEnroll/Minerva/GenBG/GeoStorage/Markers/Analytics/Hermosa + device_id/wifi_ssid/persistentAttestationDeviceId/cofDeviceId/lagunaDeviceId/blizzardClientId/argos_token — TX+REPLY)", ts: Date.now(), backtrace: [] });

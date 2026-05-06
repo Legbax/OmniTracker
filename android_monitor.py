@@ -81,10 +81,30 @@ def colorize(text, color):
 HOOKS_DIR = Path(__file__).parent / "hooks"
 
 LAYER_FILES = {
-    "java":    HOOKS_DIR / "layer1_java.js",
-    "native":  HOOKS_DIR / "layer2_native.js",
-    "binder":  HOOKS_DIR / "layer3_binder.js",
-    "scanner": HOOKS_DIR / "layer4_scanner.js",
+    "java":      HOOKS_DIR / "layer1_java.js",
+    "native":    HOOKS_DIR / "layer2_native.js",
+    "binder":    HOOKS_DIR / "layer3_binder.js",
+    "scanner":   HOOKS_DIR / "layer4_scanner.js",
+    "argos":     HOOKS_DIR / "layer5_argos.js",
+    "scplugin":  HOOKS_DIR / "layer6_scplugin.js",
+    "libclient": HOOKS_DIR / "layer7_libclient.js",
+    "probe":     HOOKS_DIR / "probe_modules.js",
+    "evp_aead":  HOOKS_DIR / "probe_evp_aead.js",
+    "crypto_wide": HOOKS_DIR / "probe_crypto_wide.js",
+    "camplat_aes": HOOKS_DIR / "probe_libcamplat_aes.js",
+    "libclient_aes": HOOKS_DIR / "probe_libclient_aes.js",
+    "tamperdetect": HOOKS_DIR / "layer_tamperdetect.js",
+    "ferrite_diag": HOOKS_DIR / "probe_ferrite_diag.js",
+    "provoke_syscall": HOOKS_DIR / "provoke_syscall.js",
+    "provoke_self_crash": HOOKS_DIR / "provoke_self_crash.js",
+    "module_at_addr": HOOKS_DIR / "probe_module_at_addr.js",
+    "stalker_test": HOOKS_DIR / "probe_stalker_test.js",
+    "stalker_snap_thread": HOOKS_DIR / "probe_stalker_snap_thread.js",
+    "iew_cipher": HOOKS_DIR / "probe_iew_cipher.js",
+    "signup_outer": HOOKS_DIR / "probe_signup_outer.js",
+    "ferrite_bypass": HOOKS_DIR / "probe_ferrite_bypass.js",
+    "provoke_ferrite_observe": HOOKS_DIR / "provoke_ferrite_observe.js",
+    "provoke_ferrite_bypass": HOOKS_DIR / "provoke_ferrite_bypass.js",
 }
 
 
@@ -259,8 +279,31 @@ class AndroidMonitor:
         if event_type == "__INIT__":
             print(colorize(f"    [+] {payload.get('value', '')}", DIM))
             return
+        if event_type in ("__INIT_HOOK__", "__INIT_HOOK_FAIL__"):
+            ok = event_type == "__INIT_HOOK__"
+            label = payload.get("value", "?")
+            err = payload.get("err", "")
+            color = DIM if ok else RED
+            line = f"    [{'+' if ok else '!'}] hook {label}{(' — ' + err) if err else ''}"
+            print(colorize(line, color))
+            return
 
         self.event_count += 1
+
+        # Persist binary blob if this event ships one (layer5_argos send-with-data).
+        # Stored next to the JSONL: <output_dir>/argos_blobs/<idx>_<TYPE>_<len>B.bin.
+        if data is not None and self.log_file:
+            try:
+                blob_dir = Path(self.log_file.name).parent / "argos_blobs"
+                blob_dir.mkdir(parents=True, exist_ok=True)
+                etype = str(payload.get("type", "blob")).lower()
+                length = payload.get("length", len(data))
+                fname = f"{self.event_count:05d}_{etype}_{length}B.bin"
+                (blob_dir / fname).write_bytes(data)
+                payload = dict(payload)
+                payload["blob_file"] = str(Path("argos_blobs") / fname)
+            except OSError as e:
+                print(colorize(f"[!] No se pudo escribir blob: {e}", RED))
 
         # Console output
         print(format_event(payload))
@@ -293,13 +336,22 @@ class AndroidMonitor:
 
     def _load_scripts(self, layers: list[str], staggered: bool = False) -> bool:
         if staggered and len(layers) > 1:
-            # Separate scanner from main layers — scanner is heavy and loads last
-            main_layers = [l for l in layers if l != "scanner"]
-            has_scanner = "scanner" in layers
-            self._pending_scanner = has_scanner
+            # Load order matters:
+            # 1. Scanner FIRST — its one-shot scans (props snapshot, RWX walk,
+            #    module enumeration, coherence checks) need a quiet RPC pipe.
+            #    If we load it last, the other layers have been firing events
+            #    for ~12s and Frida's RPC channel is congested → script.load()
+            #    times out. Loading it first means the scans run while the
+            #    pipe is still idle.
+            # 2. Then java/native/binder one by one with 4s delay so ART has
+            #    time to stabilize between heavy hook installations.
+            self._pending_scanner = False  # we load it inline, not deferred
+            ordered = []
+            if "scanner" in layers:
+                ordered.append("scanner")
+            ordered.extend(l for l in layers if l != "scanner")
 
-            # Load main layers one by one with delay
-            for layer in main_layers:
+            for layer in ordered:
                 js = load_hooks([layer])
                 if not js:
                     print(f"[!] No se pudo cargar hook: {layer}")
@@ -310,7 +362,12 @@ class AndroidMonitor:
                     script.load()
                     self.scripts.append(script)
                     print(f"    [+] Capa '{layer}' inyectada")
-                    time.sleep(4)  # 4s between layers to let ART stabilize
+                    # Short delay only — longer delays let the previously
+                    # loaded layers accumulate event backlog in the agent's
+                    # JS event loop, which then blocks the next script.load()
+                    # RPC and causes "timeout was reached" on layer #3 or #4.
+                    # 0.8s is enough for the new script's __INIT__ to flush.
+                    time.sleep(0.8)
                 except (frida.InvalidOperationError, frida.TransportError) as e:
                     print(f"[!] Error al cargar capa '{layer}': {e}")
                     continue
@@ -415,8 +472,16 @@ class AndroidMonitor:
         if not self._attach_session(pid):
             return False
 
-        print(f"[+] Cargando hooks en capas (staggered): {', '.join(layers)}")
-        return self._load_scripts(layers, staggered=True)
+        # Use combined (single-script) load when 'provoke_*' is in layers — those
+        # scripts must share globalThis with the consumer scripts (e.g. layer2_native
+        # gates _OT_SYSCALL_HOOK off globalThis). Staggered creates separate JS
+        # VMs per layer and the global gets siloed.
+        use_staggered = not any(l.startswith("provoke") for l in layers)
+        if use_staggered:
+            print(f"[+] Cargando hooks en capas (staggered): {', '.join(layers)}")
+        else:
+            print(f"[+] Cargando hooks en capas (combined, provoke detected): {', '.join(layers)}")
+        return self._load_scripts(layers, staggered=use_staggered)
 
     # -- Main monitor loop --
 
@@ -463,15 +528,18 @@ class AndroidMonitor:
             sys.exit(1)
 
         # Parse layers
-        all_layers = ["java", "native", "binder", "scanner"]
+        # 'argos', 'scplugin' y 'libclient' son opcionales (Snap-specific) —
+        # no se incluyen por defecto.
+        all_layers = ["java", "native", "binder", "scanner", "argos", "scplugin", "libclient", "probe", "evp_aead", "crypto_wide", "camplat_aes", "libclient_aes", "tamperdetect", "ferrite_diag", "provoke_syscall", "provoke_self_crash", "module_at_addr", "stalker_test", "stalker_snap_thread", "iew_cipher", "signup_outer", "ferrite_bypass", "provoke_ferrite_observe", "provoke_ferrite_bypass"]
+        default_layers = ["java", "native", "binder", "scanner"]
         if self.args.layers:
             layers = [l.strip().lower() for l in self.args.layers.split(",")]
             invalid = [l for l in layers if l not in all_layers]
             if invalid:
-                print(f"[!] Capas inválidas: {invalid}. Usa: java, native, binder, scanner")
+                print(f"[!] Capas inválidas: {invalid}. Usa: java, native, binder, scanner, argos, scplugin, libclient")
                 sys.exit(1)
         else:
-            layers = all_layers
+            layers = default_layers
 
         # Open log file
         if self.args.output:
